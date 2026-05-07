@@ -36,7 +36,7 @@ import type { SessionStatus } from "@opencode-ai/sdk/v2/client"
 import type { PermissionRequest } from "@/types/permission"
 import type { QuestionRequest } from "@/types/question"
 import * as sessionActions from "./session-actions"
-import { mergeMessages } from "./optimistic"
+import { getSessionMaterializationStatus, materializeSessionSnapshots } from "./materialization"
 
 // ---------------------------------------------------------------------------
 // Context
@@ -123,7 +123,7 @@ let bootingRoot = false
 let bootedAt = 0
 const BOOT_DEBOUNCE_MS = 1500
 const RECONNECT_MESSAGE_LIMIT = 30
-const REPAIR_MESSAGE_LIMIT = 30
+const SESSION_MATERIALIZATION_MESSAGE_LIMIT = 30
 const RECONNECT_SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
 const requestSignature = (items: Array<{ id: string }> | undefined): string => {
   if (!items || items.length === 0) return ""
@@ -135,117 +135,77 @@ const requestSignature = (items: Array<{ id: string }> | undefined): string => {
 
 const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 
-const partRepairSignature = (part: Part): string => JSON.stringify(part)
 const syncSnapshotSignature = (value: unknown): string => JSON.stringify(value)
-
-function haveEquivalentPartSnapshots(left: Part[] | undefined, right: Part[]): boolean {
-  if (!left) {
-    return right.length === 0
-  }
-
-  if (left.length !== right.length) {
-    return false
-  }
-
-  for (let index = 0; index < left.length; index += 1) {
-    const leftPart = left[index]
-    const rightPart = right[index]
-    if (!leftPart || !rightPart) {
-      return false
-    }
-    if (leftPart.id !== rightPart.id) {
-      return false
-    }
-    if (partRepairSignature(leftPart) !== partRepairSignature(rightPart)) {
-      return false
-    }
-  }
-
-  return true
-}
 
 function haveEquivalentSyncSnapshots(left: unknown, right: unknown): boolean {
   return syncSnapshotSignature(left) === syncSnapshotSignature(right)
 }
 
 // ---------------------------------------------------------------------------
-// Parts-gap recovery — when SSE events arrive but parts are missing,
-// trigger a targeted re-fetch for the affected sessions.
+// Session materialization scheduler — when local message/part state is incomplete,
+// fetch the canonical session snapshot and materialize messages and parts together.
 // Tracked per-directory, deduplicated, and auto-expiring.
 // ---------------------------------------------------------------------------
 
-type PendingRepair = {
+type PendingSessionMaterialization = {
   sessionID: string
   directory: string
   enqueuedAt: number
 }
 
-const REPAIR_COOLDOWN_MS = 5_000
-const pendingRepairs = new Map<string, PendingRepair>() // key: directory:sessionID
+const SESSION_MATERIALIZATION_COOLDOWN_MS = 5_000
+const pendingSessionMaterializations = new Map<string, PendingSessionMaterialization>() // key: directory:sessionID
 
-const repairKey = (directory: string, sessionID: string) => `${directory}:${sessionID}`
+const materializationKey = (directory: string, sessionID: string) => `${directory}:${sessionID}`
 
-function enqueuePartsRepair(directory: string, sessionID: string, childStores: ChildStoreManager) {
+function enqueueSessionMaterialization(directory: string, sessionID: string, childStores: ChildStoreManager) {
   if (!directory || directory === "global" || !sessionID) return
-  const k = repairKey(directory, sessionID)
-  const existing = pendingRepairs.get(k)
-  if (existing && Date.now() - existing.enqueuedAt < REPAIR_COOLDOWN_MS) return
+  const k = materializationKey(directory, sessionID)
+  const existing = pendingSessionMaterializations.get(k)
+  if (existing && Date.now() - existing.enqueuedAt < SESSION_MATERIALIZATION_COOLDOWN_MS) return
 
-  pendingRepairs.set(k, { sessionID, directory, enqueuedAt: Date.now() })
+  pendingSessionMaterializations.set(k, { sessionID, directory, enqueuedAt: Date.now() })
 
   // Defer to next microtask so we don't hold up the current event batch
   void Promise.resolve().then(async () => {
     const store = childStores.getChild(directory)
     if (!store) {
-      pendingRepairs.delete(k)
+      pendingSessionMaterializations.delete(k)
       return
     }
     try {
-      await repairSessionParts(directory, sessionID, store)
+      await materializeSessionFromServer(directory, sessionID, store)
     } catch {
       // Transient failure — next SSE event or reconnect will catch up.
     } finally {
-      pendingRepairs.delete(k)
+      pendingSessionMaterializations.delete(k)
     }
   })
 }
 
-async function repairSessionParts(
+async function materializeSessionFromServer(
   directory: string,
   sessionID: string,
   store: StoreApi<DirectoryStore>,
 ) {
   const scopedClient = opencodeClient.getScopedSdkClient(directory)
   const result = await retry(() =>
-    scopedClient.session.messages({ sessionID, limit: REPAIR_MESSAGE_LIMIT }),
+    scopedClient.session.messages({ sessionID, limit: SESSION_MATERIALIZATION_MESSAGE_LIMIT }),
   )
   const records = (result.data ?? []).filter((record: { info?: { id?: string } }) => !!record?.info?.id)
   if (records.length === 0) return
 
   store.setState((state: DirectoryStore) => {
-    const nextMessages = records
-      .map((record: { info: Message }) => stripMessageDiffSnapshots(record.info))
-      .sort((a, b) => cmp(a.id, b.id))
-    const currentMessages = state.message[sessionID] ?? []
-    const mergedMessages = mergeMessages(currentMessages, nextMessages)
-    const nextPartState = { ...state.part }
-    for (const record of records) {
-      const messageId = record?.info?.id
-      if (!messageId) continue
-      const newParts = (record.parts ?? [])
-        .filter((part: Part) => !!part?.id && !RECONNECT_SKIP_PARTS.has(part.type))
-        .sort((a: Part, b: Part) => cmp(a.id, b.id))
-
-      const existing = nextPartState[messageId]
-      // Repair when parts are missing, truncated, or stale-but-same-length.
-      if (!haveEquivalentPartSnapshots(existing, newParts)) {
-        nextPartState[messageId] = newParts
-      }
-    }
-    return {
-      message: mergedMessages !== currentMessages ? { ...state.message, [sessionID]: mergedMessages } : state.message,
-      part: nextPartState,
-    }
+    const materialized = materializeSessionSnapshots(
+      state,
+      sessionID,
+      records.map((record: { info: Message; parts?: Part[] }) => ({
+        info: stripMessageDiffSnapshots(record.info),
+        parts: record.parts ?? [],
+      })),
+      { skipPartTypes: RECONNECT_SKIP_PARTS },
+    )
+    return { message: materialized.message, part: materialized.part }
   })
 }
 
@@ -289,7 +249,7 @@ function isRecentBoot() {
   return bootingRoot || Date.now() - bootedAt < BOOT_DEBOUNCE_MS
 }
 
-function getViewedSessionRecoveryTarget(directory: string) {
+function getViewedSessionMaterializationTarget(directory: string) {
   if (!_activeDirectory || !_activeSession) return null
   if (directory !== _activeDirectory) return null
   return {
@@ -870,7 +830,7 @@ async function resyncDirectoryAfterReconnect(
   const current = store.getState()
   const candidateSessionIds = getReconnectCandidateSessionIds(current, {
     directory,
-    viewedSession: getViewedSessionRecoveryTarget(directory),
+    viewedSession: getViewedSessionMaterializationTarget(directory),
   })
   if (candidateSessionIds.length === 0) return
 
@@ -940,36 +900,25 @@ async function resyncDirectoryAfterReconnect(
         sessionChanged = true
       }
 
-      // Merge parts: overwrite only messages present in the fetch snapshot.
-      // Do NOT delete parts for messages that may have been added by SSE
-      // events arriving between the fetch and the setState — those are more recent.
-      let nextPartState = state.part
-      let partsChanged = false
-      for (const record of records) {
-        const messageId = record?.info?.id
-        if (!messageId) continue
-        const nextParts = (record.parts ?? [])
-          .filter((part) => !!part?.id && !RECONNECT_SKIP_PARTS.has(part.type))
-          .sort((a, b) => cmp(a.id, b.id))
-        if (!haveEquivalentPartSnapshots(state.part[messageId], nextParts)) {
-          if (!partsChanged) {
-            nextPartState = { ...state.part }
-            partsChanged = true
-          }
-          nextPartState[messageId] = nextParts
-        }
-      }
-
-      const mergedMessages = mergeMessages(state.message[sessionId] ?? [], nextMessages)
-      const messagesChanged = mergedMessages !== (state.message[sessionId] ?? [])
+      const materialized = materializeSessionSnapshots(
+        state,
+        sessionId,
+        records.map((record) => ({
+          info: stripMessageDiffSnapshots(record.info),
+          parts: record.parts ?? [],
+        })),
+        { skipPartTypes: RECONNECT_SKIP_PARTS },
+      )
+      const messagesChanged = materialized.messagesChanged
+      const partsChanged = materialized.partsChanged
       if (!sessionChanged && !messagesChanged && !partsChanged) {
         return state
       }
 
       return {
         ...(sessionChanged ? { session: sessions, sessionTotal } : {}),
-        ...(messagesChanged ? { message: { ...state.message, [sessionId]: mergedMessages } } : {}),
-        ...(partsChanged ? { part: nextPartState } : {}),
+        ...(messagesChanged ? { message: materialized.message } : {}),
+        ...(partsChanged ? { part: materialized.part } : {}),
       }
     })
 
@@ -1146,8 +1095,8 @@ function handleEvent(
     }
   }
 
-  // Sync-layer parent resync: when a child session goes idle, schedule
-  // a targeted parts repair for the parent session. This ensures the
+  // Sync-layer parent resync: when a child session goes idle, recover
+  // the parent session snapshot. This ensures the
   // parent's task tool part reflects the child's completion even when
   // no ToolPart component is mounted.
   if (payload.type === "session.idle") {
@@ -1159,7 +1108,7 @@ function handleEvent(
         ? (idleSession as Session & { parentID?: string | null }).parentID
         : null
       if (parentID) {
-        enqueuePartsRepair(resolvedDirectory, parentID, childStores)
+        enqueueSessionMaterialization(resolvedDirectory, parentID, childStores)
       }
     }
   }
@@ -1220,24 +1169,28 @@ function handleEvent(
       break
   }
 
-  if (applyDirectoryEvent(draft, payload, {
+  const reducerResult = applyDirectoryEvent(draft, payload, {
     onSetSessionTodo: (sessionID, todos) => {
       useTodosPersistStore.getState().setSessionTodos(sessionID, todos)
     },
-  })) {
+  })
+  const reducerChanged = typeof reducerResult === "boolean" ? reducerResult : reducerResult.changed
+  const materializationResult = typeof reducerResult === "boolean" ? undefined : reducerResult.materialization
+
+  if (reducerChanged) {
     store.setState(draft)
     const sessionID = getSessionIdFromPayload(payload) ?? undefined
     const messageID = getMessageIdFromPayload(payload) ?? undefined
     syncDebug.dispatch.eventApplied(payload.type, sessionID, messageID)
 
-    // Parts-gap recovery on message.updated: if the message was inserted or
+    // Snapshot materialization on message.updated: if the message was inserted or
     // replaced but draft.part[messageID] is empty, the parts were lost or
-    // never arrived. Trigger repair so the UI doesn't render a blank bubble.
+    // never arrived. Recover the session so the UI doesn't render a blank bubble.
     if (sessionID && messageID && payload.type === "message.updated") {
       const after = store.getState()
       const info = (payload.properties as { info: Message }).info
       if (info.role === "assistant" && (!after.part[messageID] || after.part[messageID].length === 0)) {
-        enqueuePartsRepair(resolvedDirectory, sessionID, childStores)
+        enqueueSessionMaterialization(resolvedDirectory, sessionID, childStores)
       }
     }
   } else {
@@ -1245,14 +1198,13 @@ function handleEvent(
     const messageID = getMessageIdFromPayload(payload) ?? undefined
     syncDebug.dispatch.eventNoChange(payload.type, sessionID, messageID)
 
-    // Parts-gap recovery: if a delta event was dropped because the parts array
-    // was missing or the partID was not found, trigger a repair fetch for the
-    // session. message.part.updated never needs repair — it only returns false
-    // for intentionally skipped types (step-start, step-finish, patch) or when
-    // preserving an existing finished tool part, neither of which indicates missing data.
-    if (sessionID && messageID && payload.type === "message.part.delta") {
-      enqueuePartsRepair(resolvedDirectory, sessionID, childStores)
-    }
+  }
+
+  // Snapshot materialization is driven by typed reducer outcomes, not by
+  // inferring meaning from a generic false/no-change result.
+  const materializationSessionID = materializationResult?.sessionID ?? getSessionIdFromPayload(payload) ?? undefined
+  if (materializationSessionID) {
+    enqueueSessionMaterialization(resolvedDirectory, materializationSessionID, childStores)
   }
 
   updateRoutingIndexFromEvent(routingIndex, resolvedDirectory, payload)
@@ -1395,20 +1347,20 @@ export function SyncProvider(props: {
   // Event pipeline — created once per mount. No class, no start/stop.
   // Abort controller owned by the pipeline closure. Cleanup aborts + flushes.
   useEffect(() => {
-    const reconnectResyncing = new Set<string>()
-    const triggerRecoveryResync = (directory: string) => {
+    const reconnectMaterializing = new Set<string>()
+    const triggerReconnectMaterialization = (directory: string) => {
       const store = childStores.children.get(directory)
       if (!store) return
-      if (reconnectResyncing.has(directory)) return
+      if (reconnectMaterializing.has(directory)) return
 
-      reconnectResyncing.add(directory)
+      reconnectMaterializing.add(directory)
       void resyncDirectoryAfterReconnect(directory, store, routingIndex)
         .catch(() => {
-          // Transient failure during resync — next SSE event, transport switch,
+          // Transient failure during materialization — next SSE event, transport switch,
           // or reconnect will catch up.
         })
         .finally(() => {
-          reconnectResyncing.delete(directory)
+          reconnectMaterializing.delete(directory)
         })
     }
 
@@ -1428,7 +1380,7 @@ export function SyncProvider(props: {
           connectionPhase: "connected",
         })
         for (const dir of childStores.children.keys()) {
-          triggerRecoveryResync(dir)
+          triggerReconnectMaterialization(dir)
         }
       },
       onDisconnect: (reason) => {
@@ -1449,7 +1401,7 @@ export function SyncProvider(props: {
           connectionPhase: "connected",
         })
         if (_activeDirectory) {
-          triggerRecoveryResync(_activeDirectory)
+          triggerReconnectMaterialization(_activeDirectory)
         }
       },
     })
@@ -1997,8 +1949,8 @@ export function useEnsureSessionMessages(sessionID: string, directory?: string) 
     if (!sessionID) return
 
     const state = store.getState()
-    // Already loaded — nothing to do
-    if (Object.prototype.hasOwnProperty.call(state.message, sessionID)) return
+    // Already loaded into a renderable message/part snapshot — nothing to do.
+    if (getSessionMaterializationStatus(state, sessionID).renderable) return
     // Session doesn't exist — nothing to load
     if (!state.session.some((s) => s.id === sessionID)) return
 
@@ -2011,38 +1963,7 @@ export function useEnsureSessionMessages(sessionID: string, directory?: string) 
 
     void (async () => {
       try {
-        const scopedClient = opencodeClient.getScopedSdkClient(dir ?? "")
-        const response = await scopedClient.session.messages({
-          sessionID: sessionID,
-          limit: RECONNECT_MESSAGE_LIMIT,
-        })
-        const records = (response.data ?? []).filter(
-          (record: { info?: { id?: string } }) => !!record?.info?.id,
-        )
-        if (records.length === 0) return
-
-        const nextMessages = records
-          .map((record: { info: Message }) => stripMessageDiffSnapshots(record.info))
-          .filter((m: Message | null): m is Message => m !== null)
-          .sort((a: Message, b: Message) => cmp(a.id, b.id))
-
-        const nextPartState: Record<string, Part[]> = {}
-        for (const record of records) {
-          const messageId = record?.info?.id
-          if (!messageId) continue
-          nextPartState[messageId] = (record.parts ?? [])
-            .filter((part: Part) => !!part?.id && !RECONNECT_SKIP_PARTS.has(part.type))
-            .sort((a: Part, b: Part) => cmp(a.id, b.id))
-        }
-
-        store.setState((state: DirectoryStore) => {
-          const currentMessages = state.message[sessionID] ?? []
-          const mergedMessages = mergeMessages(currentMessages, nextMessages)
-          return {
-            message: mergedMessages !== currentMessages ? { ...state.message, [sessionID]: mergedMessages } : state.message,
-            part: { ...state.part, ...nextPartState },
-          }
-        })
+        await materializeSessionFromServer(dir ?? "", sessionID, store)
       } catch {
         // Transient failure — next navigation or reconnect will retry
       } finally {

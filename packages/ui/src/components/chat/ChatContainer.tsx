@@ -39,6 +39,7 @@ import {
     useSessionStatus,
 } from '@/sync/sync-context';
 import { useSync } from '@/sync/use-sync';
+import { getSessionMaterializationStatus } from '@/sync/materialization';
 import { usePlanDetection } from '@/hooks/usePlanDetection';
 import { getAllSyncSessions } from '@/sync/sync-refs';
 import { useI18n } from '@/lib/i18n';
@@ -329,8 +330,8 @@ export const ChatContainer: React.FC = () => {
 
     // Sync actions
     const sync = useSync();
-    const loadMessages = React.useCallback(
-        (sessionId: string) => sync.syncSession(sessionId),
+    const ensureSessionRenderable = React.useCallback(
+        (sessionId: string) => sync.ensureSessionRenderable(sessionId),
         [sync],
     );
     const loadMoreMessages = React.useCallback(
@@ -363,9 +364,9 @@ export const ChatContainer: React.FC = () => {
         ),
     );
     const sessionMessageCount = useSessionMessageCount(currentSessionId ?? '');
-    const hasLoadedSessionMessages = useDirectorySync(
+    const hasRenderableSessionSnapshot = useDirectorySync(
         React.useCallback(
-            (state) => (currentSessionId ? state.message[currentSessionId] !== undefined : false),
+            (state) => (currentSessionId ? getSessionMaterializationStatus(state, currentSessionId).renderable : false),
             [currentSessionId],
         ),
     );
@@ -751,7 +752,7 @@ export const ChatContainer: React.FC = () => {
 
     const isSessionHydrating =
         Boolean(currentSessionId)
-        && !hasLoadedSessionMessages;
+        && !hasRenderableSessionSnapshot;
 
     React.useEffect(() => {
         if (!currentSessionId) {
@@ -783,10 +784,10 @@ export const ChatContainer: React.FC = () => {
 
     React.useEffect(() => {
         if (!currentSessionId) return;
-        if (hasLoadedSessionMessages) return;
+        if (hasRenderableSessionSnapshot) return;
 
         const load = async () => {
-            await loadMessages(currentSessionId).finally(() => {
+            await ensureSessionRenderable(currentSessionId).finally(() => {
                 const statusType = sessionStatusForCurrent.type ?? 'idle';
                 const isActivePhase = statusType === 'busy' || statusType === 'retry';
                 const hasHashTarget = typeof window !== 'undefined' && window.location.hash.length > 0;
@@ -805,7 +806,7 @@ export const ChatContainer: React.FC = () => {
         };
 
         void load();
-    }, [currentSessionId, hasLoadedSessionMessages, isPinned, loadMessages, resumeToLatestInstant, sessionStatusForCurrent.type]);
+    }, [currentSessionId, ensureSessionRenderable, hasRenderableSessionSnapshot, isPinned, resumeToLatestInstant, sessionStatusForCurrent.type]);
 
 	if (!currentSessionId && !draftOpen) {
 		return (
