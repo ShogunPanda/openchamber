@@ -1471,46 +1471,6 @@ export function SyncProvider(props: {
     return unsubscribe
   }, [props.directory, childStores])
 
-  // Re-fetch pending questions/permissions on session-switch.
-  // PR #909 only re-fetches on SSE reconnect, leaving an event-drop gap when
-  // switching sessions within the same socket — the question.asked event may
-  // have arrived while a different session was active and the directory store
-  // was evicted, or the user may navigate back to a directory whose store was
-  // rebuilt after eviction. A 250ms debounce coalesces rapid switches.
-  useEffect(() => {
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | null = null
-    let lastSessionId: string | null = null
-    let unsub: (() => void) | undefined
-    void import("./session-ui-store")
-      .then(({ useSessionUIStore }) => {
-        if (cancelled) return
-        lastSessionId = useSessionUIStore.getState().currentSessionId
-        unsub = useSessionUIStore.subscribe((state) => {
-          const nextSessionId = state.currentSessionId
-          if (nextSessionId === lastSessionId) return
-          lastSessionId = nextSessionId
-          if (!nextSessionId) return
-          const sessionDirectory = state.getDirectoryForSession(nextSessionId)
-            ?? opencodeClient.getDirectory()
-            ?? props.directory
-          if (!sessionDirectory) return
-          if (timer) clearTimeout(timer)
-          timer = setTimeout(() => {
-            const currentStore = childStores.getChild(sessionDirectory)
-            if (!currentStore) return
-            void resyncBlockingRequestsForDirectory(sessionDirectory, currentStore).catch(() => undefined)
-          }, 250)
-        })
-      })
-      .catch(() => undefined)
-    return () => {
-      cancelled = true
-      if (timer) clearTimeout(timer)
-      unsub?.()
-    }
-  }, [props.directory, childStores])
-
   return <SyncContext.Provider value={system}>{props.children}</SyncContext.Provider>
 }
 
