@@ -1,5 +1,5 @@
 import React from 'react';
-import { canUseElectronDesktopIPC } from '@/lib/desktop';
+import { canUseElectronDesktopIPC, invokeDesktop } from '@/lib/desktop';
 import { eventMatchesShortcut, getEffectiveShortcutCombo } from '@/lib/shortcuts';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
@@ -11,11 +11,6 @@ import { useSessionUIStore } from '@/sync/session-ui-store';
 const focusChatInput = () => {
   const textarea = document.querySelector<HTMLTextAreaElement>('textarea[data-chat-input="true"]');
   textarea?.focus();
-};
-
-const invokeDesktop = (command: string, args?: Record<string, unknown>) => {
-  const tauri = (window as unknown as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> } } }).__TAURI__;
-  return tauri?.core?.invoke?.(command, args ?? {});
 };
 
 export const useMiniChatKeyboardShortcuts = () => {

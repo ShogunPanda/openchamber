@@ -65,7 +65,7 @@ import { OpenInAppButton } from '@/components/desktop/OpenInAppButton';
 import { forceKillTerminal } from '@/lib/terminalApi';
 import { useTerminalStore } from '@/stores/useTerminalStore';
 import { ProjectActionsButton } from '@/components/layout/ProjectActionsButton';
-import { canUseElectronDesktopIPC, isDesktopShell, isVSCodeRuntime, startDesktopWindowDrag } from '@/lib/desktop';
+import { canUseElectronDesktopIPC, invokeDesktop, isDesktopShell, isVSCodeRuntime, startDesktopWindowDrag } from '@/lib/desktop';
 import { desktopHostsGet, locationMatchesHost, redactSensitiveUrl } from '@/lib/desktopHosts';
 import { resolveSessionDiffStats } from '@/components/session/sidebar/utils';
 import { useI18n } from '@/lib/i18n';
@@ -1281,8 +1281,7 @@ export const Header: React.FC<HeaderProps> = ({
   }, [openNewSessionDraft, setActiveMainTab, setSessionSwitcherOpen]);
 
   const handleOpenDraftMiniChat = React.useCallback(() => {
-    const tauri = (window as unknown as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> } } }).__TAURI__;
-    void tauri?.core?.invoke?.('desktop_open_draft_mini_chat_window', {
+    void invokeDesktop('desktop_open_draft_mini_chat_window', {
       directory: normalize(openDirectory || activeProject?.path || ''),
       projectId: activeProject?.id ?? null,
     }).catch((error) => {
@@ -1294,8 +1293,7 @@ export const Header: React.FC<HeaderProps> = ({
     if (!currentSessionId) {
       return;
     }
-    const tauri = (window as unknown as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> } } }).__TAURI__;
-    void tauri?.core?.invoke?.('desktop_open_session_mini_chat_window', {
+    void invokeDesktop('desktop_open_session_mini_chat_window', {
       sessionId: currentSessionId,
       directory: normalize(openDirectory || activeProject?.path || ''),
     }).catch((error) => {

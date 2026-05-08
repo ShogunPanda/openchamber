@@ -35,7 +35,7 @@ import {
   RiWindowLine,
 } from '@remixicon/react';
 import { cn } from '@/lib/utils';
-import { canUseElectronDesktopIPC, isVSCodeRuntime } from '@/lib/desktop';
+import { canUseElectronDesktopIPC, invokeDesktop, isVSCodeRuntime } from '@/lib/desktop';
 import { toast } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -433,8 +433,7 @@ function SessionNodeItemComponent(props: Props): React.ReactNode {
 
   const handleOpenMiniChatWindow = React.useCallback(() => {
     if (!sessionDirectory) return;
-    const tauri = (window as unknown as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> } } }).__TAURI__;
-    void tauri?.core?.invoke?.('desktop_open_session_mini_chat_window', {
+    void invokeDesktop('desktop_open_session_mini_chat_window', {
       sessionId: session.id,
       directory: sessionDirectory,
     }).catch((error) => {

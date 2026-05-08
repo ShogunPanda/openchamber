@@ -7,7 +7,7 @@ import { useThemeSystem } from '@/contexts/useThemeSystem';
 import { useAssistantStatus } from '@/hooks/useAssistantStatus';
 import { createWorktreeSession } from '@/lib/worktreeSessionCreator';
 import { useConfigStore } from '@/stores/useConfigStore';
-import { canUseElectronDesktopIPC, isVSCodeRuntime } from '@/lib/desktop';
+import { canUseElectronDesktopIPC, invokeDesktop, isVSCodeRuntime } from '@/lib/desktop';
 import { showOpenCodeStatus } from '@/lib/openCodeStatus';
 import { eventMatchesShortcut, getEffectiveShortcutCombo } from '@/lib/shortcuts';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
@@ -127,8 +127,7 @@ export const useKeyboardShortcuts = () => {
 
       if (canUseElectronDesktopIPC() && eventMatchesShortcut(e, combo('new_mini_chat'))) {
         e.preventDefault();
-        const tauri = (window as unknown as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> } } }).__TAURI__;
-        void tauri?.core?.invoke?.('desktop_open_draft_mini_chat_window', {
+        void invokeDesktop('desktop_open_draft_mini_chat_window', {
           directory: currentDirectory || activeProject?.path || '',
           projectId: activeProject?.id ?? null,
         }).catch((error) => {

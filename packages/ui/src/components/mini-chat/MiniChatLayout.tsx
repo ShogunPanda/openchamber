@@ -5,7 +5,7 @@ import { ChatContainer } from '@/components/chat/ChatContainer';
 import { ChatSurfaceProvider } from '@/components/chat/ChatSurfaceContext';
 import { cn } from '@/lib/utils';
 import { useI18n } from '@/lib/i18n';
-import { isElectronShell } from '@/lib/desktop';
+import { invokeDesktop, isElectronShell } from '@/lib/desktop';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useSessionWorktreeStore } from '@/sync/session-worktree-store';
 import { useSessions } from '@/sync/sync-context';
@@ -21,13 +21,6 @@ type MiniChatLayoutProps = {
   mode: MiniChatMode;
   autoOpenDraft?: boolean;
   unavailable?: boolean;
-};
-
-const invokeDesktop = async <T,>(command: string, args?: Record<string, unknown>): Promise<T | null> => {
-  if (typeof window === 'undefined') return null;
-  const tauri = (window as unknown as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<T> } } }).__TAURI__;
-  if (typeof tauri?.core?.invoke !== 'function') return null;
-  return tauri.core.invoke(command, args || {});
 };
 
 const compactPath = (value: string | null | undefined): string => {
@@ -151,8 +144,13 @@ const MiniChatHeader: React.FC<{ mode: MiniChatMode }> = ({ mode }) => {
     const payload = currentSessionId
       ? { sessionId: currentSessionId, directory: (session as { directory?: string | null } | null)?.directory ?? currentDirectory ?? '' }
       : { mode: 'draft', directory: openDirectory || currentDirectory || '', projectId: draftProjectId };
-    void invokeDesktop('desktop_focus_main_window', payload)
-      .then(() => invokeDesktop('desktop_close_current_window'));
+    void invokeDesktop<{ focused?: boolean }>('desktop_focus_main_window', payload)
+      .then((result) => {
+        if (result?.focused === true) {
+          return invokeDesktop('desktop_close_current_window');
+        }
+        return null;
+      });
   }, [currentDirectory, currentSessionId, draftProjectId, openDirectory, session]);
 
   return (

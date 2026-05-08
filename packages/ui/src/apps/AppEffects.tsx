@@ -65,12 +65,7 @@ export function SyncRuntimeEffects({ embeddedBackgroundWorkEnabled }: {
   useSessionAutoCleanup(embeddedBackgroundWorkEnabled);
   useQueuedMessageAutoSend(embeddedBackgroundWorkEnabled);
 
-  return (
-    <>
-      <SyncOptimisticBridge />
-      <MiniChatPresenceBridge />
-    </>
-  );
+  return <SyncOptimisticBridge />;
 }
 
 export function SyncAppEffects({ embeddedBackgroundWorkEnabled }: {
@@ -80,5 +75,10 @@ export function SyncAppEffects({ embeddedBackgroundWorkEnabled }: {
   useWindowControlsOverlayLayout();
   useKeyboardShortcuts();
 
-  return <SyncRuntimeEffects embeddedBackgroundWorkEnabled={embeddedBackgroundWorkEnabled} />;
+  return (
+    <>
+      <SyncRuntimeEffects embeddedBackgroundWorkEnabled={embeddedBackgroundWorkEnabled} />
+      <MiniChatPresenceBridge />
+    </>
+  );
 }

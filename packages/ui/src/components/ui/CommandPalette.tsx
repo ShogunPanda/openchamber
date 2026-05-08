@@ -43,7 +43,7 @@ import {
 import type { Session } from '@opencode-ai/sdk/v2';
 import { createWorktreeSession } from '@/lib/worktreeSessionCreator';
 import { formatShortcutForDisplay, getEffectiveShortcutCombo } from '@/lib/shortcuts';
-import { canUseElectronDesktopIPC, isDesktopShell, isVSCodeRuntime, isWebRuntime } from '@/lib/desktop';
+import { canUseElectronDesktopIPC, invokeDesktop, isDesktopShell, isVSCodeRuntime, isWebRuntime } from '@/lib/desktop';
 import { SETTINGS_PAGE_METADATA, type SettingsRuntimeContext } from '@/lib/settings/metadata';
 import { getSettingsNavIcon } from '@/components/views/SettingsView';
 import { scoreByFuzzyQuery } from '@/lib/search/fuzzySearch';
@@ -243,8 +243,7 @@ export const CommandPalette: React.FC = () => {
         shortcutId: 'new_mini_chat',
         searchText: t('commandPalette.item.newMiniChat'),
         onSelect: run(() => {
-          const tauri = (window as unknown as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> } } }).__TAURI__;
-          void tauri?.core?.invoke?.('desktop_open_draft_mini_chat_window', {
+          void invokeDesktop('desktop_open_draft_mini_chat_window', {
             directory: normalizePath(currentDirectory || activeProject?.path || ''),
             projectId: activeProject?.id ?? null,
           }).catch((error) => {

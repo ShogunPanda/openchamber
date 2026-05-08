@@ -208,6 +208,13 @@ export const hasDesktopInvoke = (): boolean => {
 
 export const canUseElectronDesktopIPC = (): boolean => isElectronShell() && hasDesktopInvoke();
 
+export const invokeDesktop = async <T = unknown>(command: string, args?: Record<string, unknown>): Promise<T | null> => {
+  if (typeof window === 'undefined') return null;
+  const tauri = (window as unknown as { __TAURI__?: TauriGlobal }).__TAURI__;
+  if (typeof tauri?.core?.invoke !== 'function') return null;
+  return tauri.core.invoke(command, args ?? {}) as Promise<T>;
+};
+
 const normalizeOrigin = (raw: string): string | null => {
   const trimmed = raw.trim();
   if (!trimmed) return null;

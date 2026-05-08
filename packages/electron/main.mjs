@@ -2321,8 +2321,9 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
           const projectId = typeof args.projectId === 'string' ? args.projectId.trim() : '';
           emitToWindow(state.mainWindow, 'openchamber:open-draft-session', { directory, projectId });
         }
+        return { focused: true };
       }
-      return null;
+      return { focused: false };
 
     case 'desktop_close_current_window':
       if (browserWindow && !browserWindow.isDestroyed()) {
