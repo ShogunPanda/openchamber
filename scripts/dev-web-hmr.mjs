@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
 import { existsSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -82,6 +83,21 @@ async function stopChildTree(child) {
 
 const uiPort = process.env.OPENCHAMBER_HMR_UI_PORT || '5180';
 const backendPort = process.env.OPENCHAMBER_HMR_API_PORT || '3902';
+const hmrHost = process.env.OPENCHAMBER_HMR_HOST || '127.0.0.1';
+
+function getLanAddresses() {
+  const interfaces = os.networkInterfaces();
+  const addresses = [];
+
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries || []) {
+      if (entry.family !== 'IPv4' || entry.internal) continue;
+      addresses.push(entry.address);
+    }
+  }
+
+  return addresses;
+}
 
 function clearViteCache() {
   const cacheDirs = [
@@ -103,7 +119,7 @@ const api = run('api', 'bun', ['run', '--cwd', 'packages/web', 'dev:server:watch
 const vite = run(
   'vite',
   'bun',
-  ['x', 'vite', '--force', '--host', '127.0.0.1', '--port', uiPort, '--strictPort'],
+  ['x', 'vite', '--force', '--host', hmrHost, '--port', uiPort, '--strictPort'],
   {
     OPENCHAMBER_PORT: backendPort,
     OPENCHAMBER_DISABLE_PWA_DEV: '1',
@@ -111,8 +127,16 @@ const vite = run(
   { cwd: webRoot },
 );
 
+const lanAddresses = hmrHost === '0.0.0.0' ? getLanAddresses() : [];
+
 console.log(`[dev:web:hmr] UI with HMR: http://127.0.0.1:${uiPort}`);
+for (const address of lanAddresses) {
+  console.log(`[dev:web:hmr] LAN UI with HMR: http://${address}:${uiPort}`);
+}
 console.log(`[dev:web:hmr] API: http://127.0.0.1:${backendPort}`);
+if (hmrHost === '0.0.0.0' && lanAddresses.length === 0) {
+  console.log('[dev:web:hmr] No LAN IPv4 address detected; check your network connection.');
+}
 console.log('[dev:web:hmr] IMPORTANT: open UI URL above for HMR; backend URL has no HMR');
 
 let shuttingDown = false;
