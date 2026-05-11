@@ -656,6 +656,10 @@ export interface NotificationPayload {
   body?: string;
 
   tag?: string;
+  kind?: string;
+  sessionId?: string;
+  directory?: string;
+  requireHidden?: boolean;
 }
 
 export interface NotificationsAPI {

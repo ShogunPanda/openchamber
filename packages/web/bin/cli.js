@@ -2,6 +2,7 @@
 
 import fs from 'fs';
 import net from 'net';
+import dgram from 'dgram';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
@@ -135,10 +136,21 @@ function isUnsafeBrowserPort(port) {
   return Number.isFinite(port) && UNSAFE_BROWSER_PORTS.has(Math.trunc(port));
 }
 
-function resolveApiHost() {
-  const configured = typeof process.env.OPENCHAMBER_HOST === 'string'
-    ? process.env.OPENCHAMBER_HOST.trim()
-    : '';
+function resolveConfiguredBindHost(hostOverride) {
+  const configured = typeof hostOverride === 'string' && hostOverride.trim()
+    ? hostOverride.trim()
+    : typeof process.env.OPENCHAMBER_HOST === 'string'
+      ? process.env.OPENCHAMBER_HOST.trim()
+      : '';
+  return configured || '127.0.0.1';
+}
+
+function isWildcardBindHost(host) {
+  return host === '0.0.0.0' || host === '::' || host === '[::]';
+}
+
+function resolveApiHost(hostOverride) {
+  const configured = resolveConfiguredBindHost(hostOverride);
 
   if (!configured) {
     return '127.0.0.1';
@@ -166,10 +178,91 @@ function formatHostForUrl(host) {
   return host.includes(':') ? `[${host}]` : host;
 }
 
-function buildLocalUrl(port, endpoint = '') {
-  const host = formatHostForUrl(resolveApiHost());
+function buildLocalUrl(port, endpoint = '', hostOverride) {
+  const host = formatHostForUrl(resolveApiHost(hostOverride));
   const pathPart = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
   return `http://${host}:${port}${pathPart}`;
+}
+
+async function detectLanIPv4Address() {
+  const ip = await new Promise((resolve) => {
+    const socket = dgram.createSocket('udp4');
+    const finish = (value) => {
+      try { socket.close(); } catch {}
+      resolve(value);
+    };
+    socket.once('error', () => finish(null));
+    try {
+      socket.connect(80, '8.8.8.8', (error) => {
+        if (error) return finish(null);
+        try {
+          const addr = socket.address();
+          finish(addr && typeof addr.address === 'string' ? addr.address : null);
+        } catch {
+          finish(null);
+        }
+      });
+    } catch {
+      finish(null);
+    }
+  });
+
+  if (ip && ip !== '0.0.0.0' && !ip.startsWith('127.')) return ip;
+
+  for (const entries of Object.values(os.networkInterfaces() || {})) {
+    for (const entry of entries || []) {
+      if (entry.family === 'IPv4' && !entry.internal && entry.address) {
+        return entry.address;
+      }
+    }
+  }
+  return null;
+}
+
+async function resolveConnectUrlServerUrl(options) {
+  let hostOverride = options.host;
+  if (typeof hostOverride !== 'string' && !process.env.OPENCHAMBER_HOST) {
+    const storedOptions = readInstanceOptions(await getInstanceFilePath(options.port));
+    if (typeof storedOptions?.host === 'string' && storedOptions.host.trim()) {
+      hostOverride = storedOptions.host.trim();
+    }
+  }
+
+  const bindHost = resolveConfiguredBindHost(hostOverride);
+  if (!isWildcardBindHost(bindHost)) {
+    return {
+      serverUrl: buildLocalUrl(options.port, '/', hostOverride).replace(/\/+$/, ''),
+      source: 'configured-host',
+    };
+  }
+
+  const lanAddress = await detectLanIPv4Address();
+  if (!lanAddress) {
+    return {
+      serverUrl: buildLocalUrl(options.port, '/').replace(/\/+$/, ''),
+      source: 'loopback-fallback',
+    };
+  }
+
+  return {
+    serverUrl: `http://${formatHostForUrl(lanAddress)}:${options.port}`,
+    source: 'lan-detected',
+  };
+}
+
+function normalizeServerUrlForConnection(value) {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null;
+    }
+    parsed.hash = '';
+    return parsed.toString().replace(/\/+$/, '');
+  } catch {
+    return null;
+  }
 }
 
 function getOpenChamberDataDir() {
@@ -606,6 +699,7 @@ function parseArgs(argv = process.argv.slice(2)) {
     tokenFile: undefined,
     tokenStdin: false,
     hostname: undefined,
+    server: undefined,
     connectTtl: undefined,
     sessionTtl: undefined,
     qr: false,
@@ -618,6 +712,7 @@ function parseArgs(argv = process.argv.slice(2)) {
     explicitPort: false,
     explicitUiPassword: false,
     foreground: false,
+    lan: false,
   };
 
   const removedFlagErrors = [];
@@ -690,6 +785,9 @@ function parseArgs(argv = process.argv.slice(2)) {
         options.host = value.trim();
         break;
       }
+      case 'lan':
+        options.lan = true;
+        break;
       case 'ui-password': {
         const { value, nextIndex } = consumeValue(i, inlineValue);
         i = nextIndex;
@@ -746,6 +844,16 @@ function parseArgs(argv = process.argv.slice(2)) {
         const { value, nextIndex } = consumeValue(i, inlineValue);
         i = nextIndex;
         options.hostname = typeof value === 'string' ? value : options.hostname;
+        break;
+      }
+      case 'server':
+      case 'server-url': {
+        const { value, nextIndex } = consumeValue(i, inlineValue);
+        i = nextIndex;
+        if (typeof value !== 'string' || value.trim().length === 0) {
+          throw new TunnelCliError('Missing value for --server.', EXIT_CODE.USAGE_ERROR);
+        }
+        options.server = value.trim();
         break;
       }
       case 'connect-ttl': {
@@ -850,6 +958,14 @@ function parseArgs(argv = process.argv.slice(2)) {
   const subcommand = command === 'tunnel' ? (positional[1] || 'help') : null;
   const tunnelAction = command === 'tunnel' ? (positional[2] || null) : null;
 
+  if (options.lan && typeof options.host !== 'string') {
+    options.host = '0.0.0.0';
+  }
+
+  if (command !== 'tunnel' && typeof options.hostname === 'string' && typeof options.host !== 'string') {
+    options.host = options.hostname;
+  }
+
   return {
     command,
     subcommand,
@@ -881,6 +997,9 @@ COMMANDS:
 OPTIONS:
   -p, --port              Web server port (default: ${DEFAULT_PORT})
   --host                  Bind address (default: 127.0.0.1)
+  --hostname              Alias for --host outside tunnel commands
+  --lan                   Bind to 0.0.0.0 for LAN access
+  --server <url>          Public/server URL for connect-url links
   --ui-password           Protect browser UI with single password
   --foreground            Run server in foreground (use with systemd/process managers)
   --no-daemon             Alias for --foreground
@@ -899,8 +1018,10 @@ ENVIRONMENT:
 EXAMPLES:
   openchamber                    # Start in daemon mode on default port 3000 (or free port)
   openchamber --port 8080        # Start on port 8080 (daemon)
+  openchamber --lan --port 3002  # Start on LAN at 0.0.0.0:3002
   openchamber serve --foreground # Start in foreground (for systemd Type=simple)
   openchamber connect-url --port 3000 --qr
+  openchamber connect-url --server https://openchamber.example.com
   openchamber tunnel help        # Show tunnel lifecycle help
   openchamber logs               # Follow logs for latest running instance
 `);
@@ -3121,7 +3242,14 @@ const commands = {
 
   async 'connect-url'(options = {}) {
     assertSafeBrowserPort(options.port, { context: 'OpenChamber connect-url' });
-    const serverUrl = buildLocalUrl(options.port, '/').replace(/\/+$/, '');
+    const explicitServerUrl = options.server ? normalizeServerUrlForConnection(options.server) : null;
+    if (options.server && !explicitServerUrl) {
+      throw new TunnelCliError('Invalid --server URL. Use an http:// or https:// URL.', EXIT_CODE.USAGE_ERROR);
+    }
+    const resolvedServerUrl = explicitServerUrl
+      ? { serverUrl: explicitServerUrl, source: 'explicit' }
+      : await resolveConnectUrlServerUrl(options);
+    const serverUrl = resolvedServerUrl.serverUrl;
     const label = options.name || `OpenChamber ${serverUrl}`;
     const runtime = createRemoteClientAuthRuntime({
       fsPromises: fs.promises,
@@ -3145,6 +3273,11 @@ const commands = {
     clackIntro('OpenChamber connect URL');
     logStatus('success', connectUrl);
     clackLog.info(`Server URL: ${serverUrl}`);
+    if (resolvedServerUrl.source === 'lan-detected') {
+      clackLog.info('Detected a LAN address because OpenChamber is bound to all interfaces. Use --server to override it.');
+    } else if (resolvedServerUrl.source === 'loopback-fallback') {
+      clackLog.warn('OpenChamber is bound to all interfaces, but no LAN address was detected. Use --server to provide a reachable URL.');
+    }
     clackLog.info('Copy this connection link into another OpenChamber client. The token is shown only once.');
     if (options.qr === true) {
       await printQrCode(connectUrl);

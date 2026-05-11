@@ -2,6 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createNotificationTemplateRuntime } from './template-runtime.js';
 
+const originalFetch = globalThis.fetch;
+
+const stubFetch = (handler) => {
+  globalThis.fetch = vi.fn(handler);
+};
+
 const createRuntime = (settings = {}) => createNotificationTemplateRuntime({
   readSettingsFromDisk: async () => settings,
   persistSettings: vi.fn(async () => {}),
@@ -12,11 +18,11 @@ const createRuntime = (settings = {}) => createNotificationTemplateRuntime({
 
 describe('notification template runtime zen models', () => {
   afterEach(() => {
-    vi.unstubAllGlobals();
+    globalThis.fetch = originalFetch;
   });
 
   it('uses zen models with zero-cost metadata as selectable', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (url) => {
+    stubFetch(async (url) => {
       if (String(url).includes('models.dev')) {
         return {
           ok: true,
@@ -43,7 +49,7 @@ describe('notification template runtime zen models', () => {
           ],
         }),
       };
-    }));
+    });
 
     const runtime = createRuntime();
     const models = await runtime.fetchFreeZenModels();
@@ -56,7 +62,7 @@ describe('notification template runtime zen models', () => {
   });
 
   it('falls back to a valid unauthenticated model when stored zen model is stale', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (url) => {
+    stubFetch(async (url) => {
       if (String(url).includes('models.dev')) {
         return {
           ok: true,
@@ -79,7 +85,7 @@ describe('notification template runtime zen models', () => {
           ],
         }),
       };
-    }));
+    });
 
     const runtime = createRuntime({ zenModel: 'trinity-large-preview-free' });
 

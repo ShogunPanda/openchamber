@@ -21,6 +21,8 @@ import { useInputStore } from '@/sync/input-store';
 import { ContextPanelContent } from './ContextSidebarTab';
 import { toast } from '@/components/ui';
 import { runtimeFetch } from '@/lib/runtime-fetch';
+import { getRuntimeUrlResolver } from '@/lib/runtime-url';
+import { getRuntimeApiBaseUrl } from '@/lib/runtime-switch';
 
 const CONTEXT_PANEL_MIN_WIDTH = 360;
 const CONTEXT_PANEL_MAX_WIDTH = 1400;
@@ -362,7 +364,7 @@ type PreviewPaneProps = {
 type PreviewProxyState =
   | { status: 'idle' }
   | { status: 'loading' }
-  | { status: 'ready'; proxyBasePath: string; expiresAt: number }
+  | { status: 'ready'; proxyBasePath: string; previewToken: string; expiresAt: number }
   | { status: 'error'; message: string };
 
 // Module-scoped, in-memory cache of registered proxy targets keyed by the
@@ -372,9 +374,38 @@ type PreviewProxyState =
 // the proxy id, so a stale persisted entry would 404 after a server restart.
 // Entries are evicted on registration error (refetched) or when the upstream
 // returns 403 (cookie expired) / 404 (target unknown) at iframe load time.
-type CachedProxyTarget = { proxyBasePath: string; expiresAt: number };
+type CachedProxyTarget = { proxyBasePath: string; previewToken: string; expiresAt: number };
 const previewProxyTargetCache = new Map<string, CachedProxyTarget>();
 const PREVIEW_PROXY_CACHE_SAFETY_MS = 30_000;
+
+const getPreviewProxyOrigin = (proxySrc: string): string => {
+  if (typeof window === 'undefined') return '';
+  try {
+    return new URL(proxySrc || window.location.href, window.location.href).origin;
+  } catch {
+    return window.location.origin;
+  }
+};
+
+const postPreviewBridgeMessage = (frameWindow: Window, proxySrc: string, payload: Record<string, unknown>): void => {
+  const targetOrigin = getPreviewProxyOrigin(proxySrc);
+  frameWindow.postMessage(payload, targetOrigin);
+  if (targetOrigin !== '*') {
+    frameWindow.postMessage(payload, '*');
+  }
+};
+
+const stripPreviewTokenFromUrl = (value: string): string => {
+  if (!value) return value;
+  try {
+    const parsed = new URL(value);
+    parsed.searchParams.delete('oc_preview_token');
+    parsed.searchParams.delete('oc_client_token');
+    return parsed.toString();
+  } catch {
+    return value;
+  }
+};
 
 const getCachedProxyTarget = (url: string): CachedProxyTarget | null => {
   const entry = previewProxyTargetCache.get(url);
@@ -427,6 +458,7 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl, onNavigate }) => {
     : null;
 
   const targetKey = normalizedUrl ? normalizedUrl.toString() : '';
+  const proxyCacheKey = targetKey ? `${getRuntimeApiBaseUrl() || 'same-origin'}|${targetKey}` : '';
   const previewColorScheme = currentTheme.metadata.variant;
 
   React.useEffect(() => {
@@ -435,9 +467,9 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl, onNavigate }) => {
       return;
     }
 
-    const cached = getCachedProxyTarget(targetKey);
+    const cached = getCachedProxyTarget(proxyCacheKey);
     if (cached) {
-      setProxyState({ status: 'ready', proxyBasePath: cached.proxyBasePath, expiresAt: cached.expiresAt });
+      setProxyState({ status: 'ready', proxyBasePath: cached.proxyBasePath, previewToken: cached.previewToken, expiresAt: cached.expiresAt });
       return;
     }
 
@@ -454,7 +486,7 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl, onNavigate }) => {
         });
 
         if (!response.ok) {
-          previewProxyTargetCache.delete(targetKey);
+          previewProxyTargetCache.delete(proxyCacheKey);
           const errorBody = await response.json().catch(() => ({}));
           const message = typeof errorBody?.error === 'string'
             ? errorBody.error
@@ -465,23 +497,24 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl, onNavigate }) => {
           return;
         }
 
-        const body = await response.json() as { proxyBasePath?: unknown; expiresAt?: unknown };
+        const body = await response.json() as { proxyBasePath?: unknown; previewToken?: unknown; expiresAt?: unknown };
         const proxyBasePath = typeof body.proxyBasePath === 'string' ? body.proxyBasePath : '';
+        const previewToken = typeof body.previewToken === 'string' ? body.previewToken : '';
         const expiresAt = typeof body.expiresAt === 'number' ? body.expiresAt : 0;
-        if (!proxyBasePath) {
-          previewProxyTargetCache.delete(targetKey);
+        if (!proxyBasePath || !previewToken) {
+          previewProxyTargetCache.delete(proxyCacheKey);
           if (!cancelled) {
             setProxyState({ status: 'error', message: t('contextPanel.preview.proxyError') });
           }
           return;
         }
 
-        previewProxyTargetCache.set(targetKey, { proxyBasePath, expiresAt });
+        previewProxyTargetCache.set(proxyCacheKey, { proxyBasePath, previewToken, expiresAt });
         if (!cancelled) {
-          setProxyState({ status: 'ready', proxyBasePath, expiresAt });
+          setProxyState({ status: 'ready', proxyBasePath, previewToken, expiresAt });
         }
       } catch (error) {
-        previewProxyTargetCache.delete(targetKey);
+        previewProxyTargetCache.delete(proxyCacheKey);
         if (!cancelled) {
           const message = error instanceof Error ? error.message : String(error);
           setProxyState({ status: 'error', message });
@@ -492,7 +525,7 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl, onNavigate }) => {
     return () => {
       cancelled = true;
     };
-  }, [isLoopback, proxyRegistrationNonce, t, targetKey]);
+  }, [isLoopback, proxyCacheKey, proxyRegistrationNonce, t, targetKey]);
 
   const directSrc = normalizedUrl
     && (normalizedUrl.protocol === 'http:' || normalizedUrl.protocol === 'https:')
@@ -504,14 +537,15 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl, onNavigate }) => {
       const path = normalizedUrl.pathname || '/';
       const searchParams = new URLSearchParams(normalizedUrl.search);
       searchParams.set('ocPreview', String(reloadNonce));
+      searchParams.set('oc_preview_token', proxyState.previewToken);
       const search = searchParams.toString();
       const hash = normalizedUrl.hash || '';
-      return `${proxyState.proxyBasePath}${path}${search ? `?${search}` : ''}${hash}`;
+      return getRuntimeUrlResolver().authenticatedAsset(`${proxyState.proxyBasePath}${path}${search ? `?${search}` : ''}${hash}`);
     })()
     : '';
 
   const effectiveSrc = isLoopback ? proxySrc : directSrc;
-  const headerSrc = effectiveSrc || directSrc;
+  const headerSrc = isLoopback ? stripPreviewTokenFromUrl(proxySrc) : directSrc;
   const showLoading = isLoopback && (proxyState.status === 'loading' || proxyState.status === 'idle');
   const showError = isLoopback && proxyState.status === 'error';
 
@@ -577,26 +611,26 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl, onNavigate }) => {
     if (!bridgeReady || !frameWindow) {
       return;
     }
-    frameWindow.postMessage({
+    postPreviewBridgeMessage(frameWindow, proxySrc, {
       source: 'openchamber-preview-parent',
       version: 1,
       type: 'set-inspect-mode',
       enabled: inspectMode,
-    }, window.location.origin);
-  }, [bridgeReady, inspectMode]);
+    });
+  }, [bridgeReady, inspectMode, proxySrc]);
 
   React.useEffect(() => {
     const frameWindow = iframeRef.current?.contentWindow;
     if (!bridgeReady || !frameWindow) {
       return;
     }
-    frameWindow.postMessage({
+    postPreviewBridgeMessage(frameWindow, proxySrc, {
       source: 'openchamber-preview-parent',
       version: 1,
       type: 'set-color-scheme',
       scheme: previewColorScheme,
-    }, window.location.origin);
-  }, [bridgeReady, previewColorScheme]);
+    });
+  }, [bridgeReady, previewColorScheme, proxySrc]);
 
   React.useEffect(() => {
     if (!inspectMode || typeof window === 'undefined') return;
@@ -829,7 +863,7 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl, onNavigate }) => {
       }
 
       if (response.status === 403 || response.status === 404) {
-        previewProxyTargetCache.delete(targetKey);
+        previewProxyTargetCache.delete(proxyCacheKey);
         setProxyState({ status: 'loading' });
         bumpProxyRegistration();
         return;
@@ -865,7 +899,7 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl, onNavigate }) => {
     return () => {
       cancelled = true;
     };
-  }, [proxySrc, reloadNonce, targetKey]);
+  }, [proxyCacheKey, proxySrc, reloadNonce]);
 
   const showUpstreamStarting = isLoopback
     && proxyState.status === 'ready'
@@ -890,7 +924,8 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl, onNavigate }) => {
 
     try {
       const location = frameWindow.location;
-      if (location.origin !== window.location.origin) {
+      const proxyOrigin = getPreviewProxyOrigin(proxySrc);
+      if (location.origin !== proxyOrigin) {
         return;
       }
       if (location.pathname.startsWith(proxyState.proxyBasePath)) {
@@ -902,7 +937,7 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({ rawUrl, onNavigate }) => {
     } catch {
       // Cross-origin frames are expected for non-loopback/direct previews.
     }
-  }, [isLoopback, proxyState]);
+  }, [isLoopback, proxySrc, proxyState]);
 
   return (
     <div className="absolute inset-0 flex flex-col">

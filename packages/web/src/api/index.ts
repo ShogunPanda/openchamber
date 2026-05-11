@@ -1,6 +1,7 @@
 import type { RuntimeAPIs } from '@openchamber/ui/lib/api/types';
 import {
   createRuntimeUrlResolver,
+  getRuntimeUrlResolver,
   setRuntimeUrlResolver,
   type RuntimeUrlResolver,
 } from '@openchamber/ui/lib/runtime-url';
@@ -19,19 +20,30 @@ export interface WebAPIsOptions {
   urls?: RuntimeUrlResolver;
 }
 
+const createActiveRuntimeUrlResolver = (): RuntimeUrlResolver => ({
+  api: (...args) => getRuntimeUrlResolver().api(...args),
+  authenticatedAsset: (...args) => getRuntimeUrlResolver().authenticatedAsset(...args),
+  auth: (...args) => getRuntimeUrlResolver().auth(...args),
+  health: (...args) => getRuntimeUrlResolver().health(...args),
+  rawFile: (...args) => getRuntimeUrlResolver().rawFile(...args),
+  sse: (...args) => getRuntimeUrlResolver().sse(...args),
+  websocket: (...args) => getRuntimeUrlResolver().websocket(...args),
+});
+
 export const createWebAPIs = (options: WebAPIsOptions = {}): RuntimeAPIs => {
   const urls = options.urls ?? createRuntimeUrlResolver();
   setRuntimeUrlResolver(urls);
+  const activeUrls = createActiveRuntimeUrlResolver();
 
   return {
   runtime: { platform: 'web', isDesktop: false, isVSCode: false, label: 'web' },
   terminal: createWebTerminalAPI(),
   git: createWebGitAPI(),
-  files: createWebFilesAPI({ urls }),
+  files: createWebFilesAPI({ urls: activeUrls }),
   settings: createWebSettingsAPI(),
   permissions: createWebPermissionsAPI(),
   notifications: createWebNotificationsAPI(),
-  github: createWebGitHubAPI({ urls }),
+  github: createWebGitHubAPI({ urls: activeUrls }),
   push: createWebPushAPI(),
   clientAuth: createWebClientAuthAPI(),
   tools: createWebToolsAPI(),

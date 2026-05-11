@@ -40,6 +40,7 @@ import { getSessionMaterializationStatus, materializeSessionSnapshots } from "./
 import { openSessionFromToast } from "./session-navigation"
 import { getRuntimeLiveStatusSeed, LIVE_STATUS_TTL_MS } from "./runtime-live-memory"
 import { getRuntimeKey } from "@/lib/runtime-switch"
+import { getRegisteredRuntimeAPIs } from "@/contexts/runtimeAPIRegistry"
 
 // ---------------------------------------------------------------------------
 // Context
@@ -239,6 +240,58 @@ const getQuestionToastKey = (sessionID?: string, requestID?: string) => {
 const getPermissionToastKey = (sessionID?: string, requestID?: string) => {
   if (!sessionID || !requestID) return null
   return `${sessionID}:${requestID}`
+}
+
+type UiNotificationPayload = {
+  title?: unknown
+  body?: unknown
+  tag?: unknown
+  kind?: unknown
+  sessionId?: unknown
+  directory?: unknown
+  requireHidden?: unknown
+  desktopStdoutActive?: unknown
+}
+
+const asOptionalString = (value: unknown): string | undefined => {
+  if (typeof value !== "string") return undefined
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
+const handleUiNotificationEvent = (payload: Event, fallbackDirectory: string): boolean => {
+  if ((payload as { type?: unknown }).type !== "openchamber:notification") {
+    return false
+  }
+
+  const properties = (payload as { properties?: unknown }).properties
+  if (!properties || typeof properties !== "object") {
+    return true
+  }
+
+  const notification = properties as UiNotificationPayload
+  if (notification.desktopStdoutActive === true && getRuntimeKey() === "local") {
+    return true
+  }
+
+  const notifications = getRegisteredRuntimeAPIs()?.notifications
+  if (!notifications?.notifyAgentCompletion) {
+    return true
+  }
+
+  void notifications.notifyAgentCompletion({
+    title: asOptionalString(notification.title),
+    body: asOptionalString(notification.body),
+    tag: asOptionalString(notification.tag),
+    kind: asOptionalString(notification.kind),
+    sessionId: asOptionalString(notification.sessionId),
+    directory: asOptionalString(notification.directory) ?? (fallbackDirectory && fallbackDirectory !== "global" ? fallbackDirectory : undefined),
+    requireHidden: notification.requireHidden === true,
+  }).catch((error) => {
+    console.warn("[notifications] failed to dispatch UI notification", error)
+  })
+
+  return true
 }
 
 export function setActiveSession(directory: string, sessionId: string) {
@@ -987,6 +1040,10 @@ function handleEvent(
   routingIndex: EventRoutingIndex,
 ) {
   const directory = resolveDirectoryFromRoutingIndex(routingIndex, rawDirectory, payload, childStores)
+
+  if (handleUiNotificationEvent(payload, directory)) {
+    return
+  }
 
   // Global events
   if (directory === "global" || !directory) {

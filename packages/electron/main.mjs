@@ -113,6 +113,8 @@ const APP_METADATA = readAppMetadata();
 const APP_VERSION = APP_METADATA.version;
 
 const DEFAULT_DESKTOP_PORT = 57123;
+const LOOPBACK_BIND_HOST = '127.0.0.1';
+const LAN_BIND_HOST = '0.0.0.0';
 const MIN_WINDOW_WIDTH = 800;
 const MIN_WINDOW_HEIGHT = 520;
 const MIN_RESTORE_WINDOW_WIDTH = 900;
@@ -529,6 +531,21 @@ const classifyVersionPayload = (payload) => {
   return 'ok';
 };
 
+const fetchVersionPayload = async (versionUrl, { headers, timeoutMs }) => {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  try {
+    return await fetch(versionUrl, { signal: timeoutSignal, headers });
+  } catch (error) {
+    if (timeoutSignal.aborted) {
+      throw error;
+    }
+    return await Promise.race([
+      electronNet.fetch(versionUrl, { headers }),
+      new Promise((_, reject) => setTimeout(() => reject(error), timeoutMs)),
+    ]);
+  }
+};
+
 const probeHostWithTimeout = async (url, timeoutMs, clientToken = '') => {
   const versionUrl = buildVersionUrl(url);
   if (!versionUrl) {
@@ -542,7 +559,7 @@ const probeHostWithTimeout = async (url, timeoutMs, clientToken = '') => {
     if (token) {
       headers.Authorization = `Bearer ${token}`;
     }
-    const response = await fetch(versionUrl, { signal: AbortSignal.timeout(timeoutMs), headers });
+    const response = await fetchVersionPayload(versionUrl, { headers, timeoutMs });
     const status = response.status;
     if (status === 401 || status === 403) {
       return { status: 'auth', latencyMs: Date.now() - started };
@@ -768,6 +785,9 @@ const maybeShowNativeNotification = (rawInput) => {
   const sessionId = typeof payload.sessionId === 'string' && payload.sessionId.trim()
     ? payload.sessionId.trim()
     : null;
+  const directory = typeof payload.directory === 'string' && payload.directory.trim()
+    ? payload.directory.trim()
+    : null;
 
   const notification = new Notification({
     title,
@@ -782,7 +802,7 @@ const maybeShowNativeNotification = (rawInput) => {
   notification.on('click', () => {
     focusForegroundWindow();
     if (sessionId) {
-      emitToAllWindows('openchamber:open-session', { sessionId });
+      emitToAllWindows('openchamber:open-session', { sessionId, directory });
     }
     release();
   });
@@ -876,7 +896,7 @@ const spawnLocalServer = async () => {
   // so phones/tablets on the same Wi-Fi can reach the app. UI shows a clear
   // warning and persists the flag via /api/config/settings.
   const lanAccessEnabled = settings.desktopLanAccessEnabled === true;
-  const bindHost = lanAccessEnabled ? '0.0.0.0' : '127.0.0.1';
+  const bindHost = lanAccessEnabled ? LAN_BIND_HOST : LOOPBACK_BIND_HOST;
 
   // Probe before starting the server — main() in the server module sets up a
   // lot of global state before binding, and calling it twice after a listen
@@ -1214,10 +1234,58 @@ const parseDeepLink = (raw) => {
     const value = segments.length > 0
       ? decodeURIComponent(segments.join('/'))
       : '';
-    return { type, value };
+    return { type, value, raw: trimmed };
   } catch {
     return null;
   }
+};
+
+const parseConnectDeepLinkPayload = (raw) => {
+  if (typeof raw !== 'string') return null;
+  try {
+    const url = new URL(raw.trim());
+    if (url.protocol !== `${DEEP_LINK_PROTOCOL}:` || url.hostname !== 'connect') return null;
+    const version = url.searchParams.get('v');
+    const serverUrl = normalizeHostUrl(url.searchParams.get('server') || '');
+    const token = sanitizeClientTokenForStorage(url.searchParams.get('token') || '');
+    const label = typeof url.searchParams.get('label') === 'string'
+      ? url.searchParams.get('label').trim()
+      : '';
+    if (version !== '1' || !serverUrl || !token) return null;
+    return { serverUrl, token, label: label || serverUrl };
+  } catch {
+    return null;
+  }
+};
+
+const importConnectDeepLink = async (payload) => {
+  if (!payload?.serverUrl || !payload?.token) return null;
+  const config = readDesktopHostsConfig();
+  const existing = config.hosts.find((host) => {
+    const hostUrl = normalizeHostUrl(host?.url || '');
+    const apiUrl = normalizeHostUrl(host?.apiUrl || host?.url || '');
+    return payload.serverUrl === hostUrl || payload.serverUrl === apiUrl;
+  });
+
+  const id = existing?.id || `host-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const importedHost = {
+    ...(existing || {}),
+    id,
+    label: payload.label || existing?.label || payload.serverUrl,
+    url: payload.serverUrl,
+    apiUrl: payload.serverUrl,
+    clientToken: payload.token,
+  };
+  const hosts = existing
+    ? config.hosts.map((host) => (host.id === existing.id ? importedHost : host))
+    : [importedHost, ...config.hosts];
+  await writeDesktopHostsConfig({
+    ...config,
+    hosts,
+    defaultHostId: config.defaultHostId || id,
+    initialHostChoiceCompleted: true,
+  });
+  return id;
 };
 
 const switchToHostById = async (rawId) => {
@@ -1254,6 +1322,17 @@ const switchToHostById = async (rawId) => {
 const dispatchDeepLink = (link) => {
   if (!link) return;
   log.info('[electron] dispatching deep-link', { type: link.type, valueLen: link.value?.length || 0 });
+  if (link.type === 'connect') {
+    const payload = parseConnectDeepLinkPayload(link.raw);
+    if (!payload) {
+      log.warn('[electron] invalid connect deep-link payload');
+      return;
+    }
+    void importConnectDeepLink(payload).then((id) => {
+      if (id) void switchToHostById(id);
+    });
+    return;
+  }
   if (link.type === 'session' && link.value) {
     emitToAllWindows('openchamber:open-session', { sessionId: link.value });
     return;
