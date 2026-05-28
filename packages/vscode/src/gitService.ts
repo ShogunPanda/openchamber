@@ -279,6 +279,45 @@ async function execGit(args: string[], cwd: string): Promise<{ stdout: string; s
   });
 }
 
+async function execGitWithInput(args: string[], cwd: string, input: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  return new Promise((resolve) => {
+    const normalizedCwd = normalizePath(cwd);
+    const gitPath = gitApi?.git.path || 'git';
+
+    buildGitEnv().then((env) => {
+      const proc = spawn(gitPath, args, {
+        cwd: normalizedCwd,
+        env,
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      proc.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      proc.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      proc.on('close', (exitCode) => {
+        resolve({ stdout, stderr, exitCode: exitCode ?? 0 });
+      });
+
+      proc.on('error', (error) => {
+        resolve({ stdout: '', stderr: error.message, exitCode: 1 });
+      });
+
+      proc.stdin.end(input);
+    }).catch((error) => {
+      resolve({ stdout: '', stderr: error instanceof Error ? error.message : String(error), exitCode: 1 });
+    });
+  });
+}
+
 function isValidCommitHash(hash: string): boolean {
   return /^[0-9a-fA-F]{7,40}$/.test(hash);
 }
@@ -2151,6 +2190,59 @@ export async function revertGitFile(
   const fallback = await execGit(['checkout', '--', filePath], directory);
   if (fallback.exitCode !== 0) {
     throw new Error(fallback.stderr || restore.stderr || 'Failed to revert git file');
+  }
+}
+
+const normalizePatchFilePath = (value: string): string => {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === '/dev/null') return trimmed;
+  if (trimmed.startsWith('a/') || trimmed.startsWith('b/')) return trimmed.slice(2);
+  return trimmed;
+};
+
+const validateSingleFilePatchPath = (patch: string, filePath: string): void => {
+  const paths = new Set<string>();
+  for (const line of patch.replace(/\r\n/g, '\n').split('\n')) {
+    if (line.startsWith('--- ') || line.startsWith('+++ ')) {
+      const normalized = normalizePatchFilePath(line.slice(4).split('\t')[0] || '');
+      if (normalized && normalized !== '/dev/null') {
+        paths.add(normalized);
+      }
+    }
+  }
+
+  if (paths.size === 0) {
+    throw new Error('Patch must include file headers');
+  }
+  if (paths.size !== 1 || !paths.has(filePath)) {
+    throw new Error('Patch does not match selected file');
+  }
+};
+
+export async function revertGitHunk(
+  directory: string,
+  payload: { path: string; staged?: boolean; patch: string },
+): Promise<void> {
+  const filePath = payload.path.trim();
+  const patch = payload.patch;
+  if (!filePath) {
+    throw new Error('path is required');
+  }
+  if (!patch.trim()) {
+    throw new Error('patch is required');
+  }
+
+  validateSingleFilePatchPath(patch, filePath);
+
+  const args = ['apply'];
+  if (payload.staged === true) {
+    args.push('--cached');
+  }
+  args.push('--reverse', '--whitespace=nowarn', '--unidiff-zero', '--recount');
+
+  const result = await execGitWithInput(args, directory, patch);
+  if (result.exitCode !== 0) {
+    throw new Error(result.stderr || result.stdout || 'Failed to revert git hunk');
   }
 }
 

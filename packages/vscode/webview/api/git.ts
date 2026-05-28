@@ -39,6 +39,7 @@ import type {
   CherryPickResponse,
   RevertCommitResponse,
   ResetToCommitResponse,
+  RevertGitHunkPayload,
 } from '@openchamber/ui/lib/api/types';
 
 export const createVSCodeGitAPI = (): GitAPI => ({
@@ -69,6 +70,10 @@ export const createVSCodeGitAPI = (): GitAPI => ({
 
   revertGitFile: async (directory: string, filePath: string, options?: { scope?: 'all' | 'working' }): Promise<void> => {
     await sendBridgeMessage('api:git/revert', { directory, path: filePath, scope: options?.scope });
+  },
+
+  revertGitHunk: async (directory: string, payload: RevertGitHunkPayload): Promise<void> => {
+    await sendBridgeMessage('api:git/revert-hunk', { directory, ...payload });
   },
 
   stageGitFile: async (directory: string, filePath: string): Promise<void> => {

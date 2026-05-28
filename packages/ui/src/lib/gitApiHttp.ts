@@ -34,6 +34,7 @@ import type {
   CherryPickResponse,
   RevertCommitResponse,
   ResetToCommitResponse,
+  RevertGitHunkPayload,
 } from './api/types';
 
 declare global {
@@ -224,6 +225,29 @@ export async function revertGitFile(
       .json()
       .catch(() => ({ error: response.statusText }));
     throw new Error(message.error || 'Failed to revert git changes');
+  }
+}
+
+export async function revertGitHunk(directory: string, payload: RevertGitHunkPayload): Promise<void> {
+  const path = payload.path.trim();
+  if (!path) {
+    throw new Error('path is required to revert git hunk');
+  }
+  if (!payload.patch.trim()) {
+    throw new Error('patch is required to revert git hunk');
+  }
+
+  const response = await fetch(buildUrl(`${API_BASE}/revert-hunk`, directory), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, staged: Boolean(payload.staged), patch: payload.patch }),
+  });
+
+  if (!response.ok) {
+    const message = await response
+      .json()
+      .catch(() => ({ error: response.statusText }));
+    throw new Error(message.error || 'Failed to revert git hunk');
   }
 }
 

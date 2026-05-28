@@ -229,6 +229,20 @@ export async function handleStandardGitBridgeMessage(message: BridgeMessageInput
       return { id, type, success: true, data: { success: true } };
     }
 
+    case 'api:git/revert-hunk': {
+      const { directory, path: filePath, staged, patch } = (payload || {}) as {
+        directory?: string;
+        path?: string;
+        staged?: boolean;
+        patch?: string;
+      };
+      if (!directory || !filePath || !patch) {
+        return { id, type, success: false, error: 'Directory, path, and patch are required' };
+      }
+      await gitService.revertGitHunk(directory, { path: filePath, staged, patch });
+      return { id, type, success: true, data: { success: true } };
+    }
+
     case 'api:git/stage': {
       const { directory, path: filePath, paths } = (payload || {}) as { directory?: string; path?: string; paths?: string[] };
       const filePaths = (Array.isArray(paths) ? paths : [filePath])

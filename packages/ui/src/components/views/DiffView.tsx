@@ -30,6 +30,7 @@ import { getContextFileOpenFailureMessage, validateContextFileOpen } from '@/lib
 import { sessionEvents } from '@/lib/sessionEvents';
 import { useI18n } from '@/lib/i18n';
 import type { I18nKey } from '@/lib/i18n/store';
+import { buildRevertHunkActions, type RevertHunkAction } from '@/lib/gitDiffHunks';
 
 // Minimum width for side-by-side diff view (px)
 const SIDE_BY_SIDE_MIN_WIDTH = 1100;
@@ -511,6 +512,8 @@ interface InlineDiffViewerProps {
     diff: DiffData;
     renderSideBySide: boolean;
     wrapLines: boolean;
+    hunkActions?: RevertHunkAction[];
+    onRevertHunk?: (action: RevertHunkAction) => Promise<void> | void;
 }
 
 const InlineDiffViewer = React.memo<InlineDiffViewerProps>(({ 
@@ -518,6 +521,8 @@ const InlineDiffViewer = React.memo<InlineDiffViewerProps>(({
     diff,
     renderSideBySide,
     wrapLines,
+    hunkActions,
+    onRevertHunk,
 }) => {
     const language = React.useMemo(
         () => getLanguageFromExtension(filePath) || 'text',
@@ -548,6 +553,8 @@ const InlineDiffViewer = React.memo<InlineDiffViewerProps>(({
                 renderSideBySide={renderSideBySide}
                 wrapLines={wrapLines}
                 layout="inline"
+                hunkActions={hunkActions}
+                onRevertHunk={onRevertHunk}
             />
         </div>
     );
@@ -560,6 +567,8 @@ interface SingleDiffViewerProps {
     isVisible: boolean;
     renderSideBySide: boolean;
     wrapLines: boolean;
+    hunkActions?: RevertHunkAction[];
+    onRevertHunk?: (action: RevertHunkAction) => Promise<void> | void;
 }
 
 const SingleDiffViewer = React.memo<SingleDiffViewerProps>(({ 
@@ -568,6 +577,8 @@ const SingleDiffViewer = React.memo<SingleDiffViewerProps>(({
     isVisible,
     renderSideBySide,
     wrapLines,
+    hunkActions,
+    onRevertHunk,
 }) => {
     const language = React.useMemo(
         () => getLanguageFromExtension(filePath) || 'text',
@@ -612,6 +623,8 @@ const SingleDiffViewer = React.memo<SingleDiffViewerProps>(({
                 renderSideBySide={renderSideBySide}
                 wrapLines={wrapLines}
                 layout="inline"
+                hunkActions={hunkActions}
+                onRevertHunk={onRevertHunk}
             />
         </ScrollableOverlay>
     );
@@ -663,6 +676,9 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(({
         }, [directory, file.path])
     );
     const setDiff = useGitStore((state) => state.setDiff);
+    const clearDiffCache = useGitStore((state) => state.clearDiffCache);
+    const fetchStatus = useGitStore((state) => state.fetchStatus);
+    const bumpIndexRevision = useGitStore((state) => state.bumpIndexRevision);
     const setDiffFileLayout = useUIStore((state) => state.setDiffFileLayout);
 
     const [isExpanded, setIsExpanded] = React.useState(!defaultCollapsed);
@@ -672,7 +688,9 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(({
     const [isLoading, setIsLoading] = React.useState(false);
     const [forceRenderLarge, setForceRenderLarge] = React.useState(false);
     const [stagedDiffData, setStagedDiffData] = React.useState<DiffData | null>(null);
+    const [hunkActions, setHunkActions] = React.useState<RevertHunkAction[]>([]);
     const lastDiffRequestRef = React.useRef<string | null>(null);
+    const lastHunkRequestRef = React.useRef<string | null>(null);
     const sectionRef = React.useRef<HTMLDivElement | null>(null);
 
     const descriptor = React.useMemo(() => describeChange(file), [file]);
@@ -739,9 +757,63 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(({
         }
 
         setStagedDiffData(null);
+        setHunkActions([]);
         setDiffLoadError(null);
         lastDiffRequestRef.current = null;
+        lastHunkRequestRef.current = null;
     }, [staged, stagedRevision]);
+
+    React.useEffect(() => {
+        if (!isExpanded || !hasBeenVisible || !diffData || diffData.isBinary) {
+            setHunkActions([]);
+            lastHunkRequestRef.current = null;
+            return;
+        }
+
+        const requestKey = `${directory}::${file.path}::${staged ? `staged:${stagedRevision}` : 'unstaged'}::hunks`;
+        if (lastHunkRequestRef.current === requestKey) {
+            return;
+        }
+        lastHunkRequestRef.current = requestKey;
+
+        let cancelled = false;
+        void git.getGitDiff(directory, { path: file.path, staged, contextLines: 0 })
+            .then((response) => {
+                if (cancelled) return;
+                setHunkActions(buildRevertHunkActions(file.path, response.diff));
+            })
+            .catch(() => {
+                if (cancelled) return;
+                setHunkActions([]);
+            });
+
+        return () => {
+            cancelled = true;
+            if (lastHunkRequestRef.current === requestKey) {
+                lastHunkRequestRef.current = null;
+            }
+        };
+    }, [diffData, directory, file.path, git, hasBeenVisible, isExpanded, staged, stagedRevision]);
+
+    const handleRevertHunk = React.useCallback(async (action: RevertHunkAction) => {
+        try {
+            await git.revertGitHunk(directory, {
+                path: file.path,
+                staged,
+                patch: action.patch,
+            });
+            clearDiffCache(directory);
+            setHunkActions([]);
+            lastHunkRequestRef.current = null;
+            if (staged) {
+                setStagedDiffData(null);
+                bumpIndexRevision(directory);
+            }
+            await fetchStatus(directory, git);
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : t('gitView.toast.revertFailed'));
+        }
+    }, [bumpIndexRevision, clearDiffCache, directory, fetchStatus, file.path, git, staged, t]);
 
     React.useEffect(() => {
         if (!isExpanded || !hasBeenVisible) return;
@@ -954,6 +1026,8 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(({
                             diff={diffData}
                             renderSideBySide={renderSideBySide}
                             wrapLines={wrapLines}
+                            hunkActions={hunkActions}
+                            onRevertHunk={handleRevertHunk}
                         />
                     ) : null}
                 </div>
@@ -993,6 +1067,8 @@ export const DiffView: React.FC<DiffViewProps> = ({
     const ensureStatus = useGitStore((state) => state.ensureStatus);
     const fetchStatus = useGitStore((state) => state.fetchStatus);
     const setDiff = useGitStore((state) => state.setDiff);
+    const clearDiffCache = useGitStore((state) => state.clearDiffCache);
+    const bumpIndexRevision = useGitStore((state) => state.bumpIndexRevision);
     const indexRevision = useGitStore(React.useCallback((state) => {
         if (!effectiveDirectory) return 0;
         return state.directories.get(effectiveDirectory)?.indexRevision ?? 0;
@@ -1006,7 +1082,9 @@ export const DiffView: React.FC<DiffViewProps> = ({
     const [pinnedStackedTarget, setPinnedStackedTarget] = React.useState<string | null>(null);
     const [diffRetryNonce, setDiffRetryNonce] = React.useState(0);
     const [diffLoadError, setDiffLoadError] = React.useState<string | null>(null);
+    const [selectedHunkActions, setSelectedHunkActions] = React.useState<RevertHunkAction[]>([]);
     const lastDiffRequestRef = React.useRef<string | null>(null);
+    const lastSelectedHunkRequestRef = React.useRef<string | null>(null);
 
     const pendingDiffFile = useUIStore((state) => state.pendingDiffFile);
     const pendingDiffStaged = useUIStore((state) => state.pendingDiffStaged);
@@ -1508,6 +1586,60 @@ export const DiffView: React.FC<DiffViewProps> = ({
         return { original: selectedCachedDiff.original, modified: selectedCachedDiff.modified, isBinary: selectedCachedDiff.isBinary };
     }, [activeDiffStaged, selectedCachedDiff, selectedStagedDiffData]);
 
+    React.useEffect(() => {
+        if (isStackedView || !effectiveDirectory || !selectedFile || !selectedDiffData || selectedDiffData.isBinary) {
+            setSelectedHunkActions([]);
+            lastSelectedHunkRequestRef.current = null;
+            return;
+        }
+
+        const requestKey = `${effectiveDirectory}::${selectedFile}::${activeDiffStaged ? `staged:${indexRevision}` : 'unstaged'}::hunks`;
+        if (lastSelectedHunkRequestRef.current === requestKey) {
+            return;
+        }
+        lastSelectedHunkRequestRef.current = requestKey;
+
+        let cancelled = false;
+        void git.getGitDiff(effectiveDirectory, { path: selectedFile, staged: activeDiffStaged, contextLines: 0 })
+            .then((response) => {
+                if (cancelled) return;
+                setSelectedHunkActions(buildRevertHunkActions(selectedFile, response.diff));
+            })
+            .catch(() => {
+                if (cancelled) return;
+                setSelectedHunkActions([]);
+            });
+
+        return () => {
+            cancelled = true;
+            if (lastSelectedHunkRequestRef.current === requestKey) {
+                lastSelectedHunkRequestRef.current = null;
+            }
+        };
+    }, [activeDiffStaged, effectiveDirectory, git, indexRevision, isStackedView, selectedDiffData, selectedFile]);
+
+    const handleSelectedRevertHunk = React.useCallback(async (action: RevertHunkAction) => {
+        if (!effectiveDirectory || !selectedFile) return;
+
+        try {
+            await git.revertGitHunk(effectiveDirectory, {
+                path: selectedFile,
+                staged: activeDiffStaged,
+                patch: action.patch,
+            });
+            clearDiffCache(effectiveDirectory);
+            setSelectedHunkActions([]);
+            lastSelectedHunkRequestRef.current = null;
+            if (activeDiffStaged) {
+                setSelectedStagedDiffData(null);
+                bumpIndexRevision(effectiveDirectory);
+            }
+            await fetchStatus(effectiveDirectory, git);
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : t('gitView.toast.revertFailed'));
+        }
+    }, [activeDiffStaged, bumpIndexRevision, clearDiffCache, effectiveDirectory, fetchStatus, git, selectedFile, t]);
+
     const [openingEditorFilePath, setOpeningEditorFilePath] = React.useState<string | null>(null);
 
     const openFileInEditorAtChange = React.useCallback(async (filePath: string, cachedDiffData: DiffData | null) => {
@@ -1656,6 +1788,8 @@ export const DiffView: React.FC<DiffViewProps> = ({
                 isVisible={true}
                 renderSideBySide={renderSideBySide}
                 wrapLines={diffWrapLines}
+                hunkActions={selectedHunkActions}
+                onRevertHunk={handleSelectedRevertHunk}
             />
         );
     };
